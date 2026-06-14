@@ -1,25 +1,33 @@
 import os
 import tempfile
-import uuid
-import asyncio
+import logging
 from pathlib import Path
 from typing import Optional
 
-import yt_dlp
-from faster_whisper import WhisperModel
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
-import uvicorn
+from faster_whisper import WhisperModel
+import yt_dlp
 
-# Configuration from environment
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
-DEVICE = os.getenv("DEVICE", "cpu")
-COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI
+app = FastAPI(
+    title="Transcription API",
+    description="Download audio from social media URLs and transcribe with faster-whisper",
+    version="1.0.0"
+)
+
+# Model configuration
+MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")  # tiny, base, small, medium, large-v3
+DEVICE = os.getenv("WHISPER_DEVICE", "auto")      # auto, cpu, cuda
+COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # int8, int16, float16, float32
 
 # Global model instance (loaded on startup)
 whisper_model: Optional[WhisperModel] = None
-
-app = FastAPI(title="Transcription API", version="1.0.0")
 
 
 class TranscribeRequest(BaseModel):
@@ -30,162 +38,149 @@ class TranscribeRequest(BaseModel):
 
 class TranscribeResponse(BaseModel):
     transcript: str
-    duration: float
     language: str
-    model_used: str
-    source_url: str
-    title: Optional[str] = None
-
-
-class HealthResponse(BaseModel):
-    status: str
-    model_loaded: bool
-    model_name: str
-    device: str
+    duration: float
+    platform: str
+    title: str
+    url: str
 
 
 @app.on_event("startup")
 async def load_model():
+    """Load Whisper model on startup."""
     global whisper_model
-    model_name = WHISPER_MODEL
+    model_name = MODEL_SIZE
+    logger.info(f"Loading Whisper model: {model_name} on {DEVICE} with {COMPUTE_TYPE}")
     try:
         whisper_model = WhisperModel(
             model_name,
             device=DEVICE,
-            compute_type=COMPUTE_TYPE,
-            download_root="/root/.cache/huggingface"
+            compute_type=COMPUTE_TYPE
         )
-        print(f"Loaded Whisper model: {model_name} on {DEVICE}")
+        logger.info("Whisper model loaded successfully")
     except Exception as e:
-        print(f"Failed to load Whisper model: {e}")
-        whisper_model = None
-
-
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    return HealthResponse(
-        status="healthy" if whisper_model else "degraded",
-        model_loaded=whisper_model is not None,
-        model_name=WHISPER_MODEL,
-        device=DEVICE
-    )
+        logger.error(f"Failed to load Whisper model: {e}")
+        raise
 
 
 def download_audio(url: str) -> tuple[str, dict]:
-    """Download audio from URL using yt-dlp, return (audio_path, video_info)"""
-    temp_dir = Path(tempfile.gettempdir())
-    audio_filename = f"{uuid.uuid4().hex}.mp3"
-    audio_path = temp_dir / audio_filename
+    """Download audio from URL using yt-dlp. Returns (audio_path, info_dict)."""
+    temp_dir = tempfile.mkdtemp()
+    audio_path = os.path.join(temp_dir, "audio.%(ext)s")
 
     ydl_opts = {
         'format': 'bestaudio/best',
-        'outtmpl': str(audio_path.with_suffix('')),
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '192',
         }],
+        'outtmpl': audio_path,
         'quiet': True,
         'no_warnings': True,
-        'extract_flat': False,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        # Find the actual downloaded file
-        downloaded_files = list(temp_dir.glob(f"{audio_filename}*"))
+        # Find the downloaded file
+        downloaded_files = list(Path(temp_dir).glob("audio.*"))
         if not downloaded_files:
-            # Try with the video ID
-            video_id = info.get('id', uuid.uuid4().hex)
-            downloaded_files = list(temp_dir.glob(f"{video_id}*"))
-        
-        if downloaded_files:
-            actual_path = downloaded_files[0]
-        else:
-            actual_path = audio_path
+            raise HTTPException(status_code=500, detail="Audio download failed")
+        final_audio_path = str(downloaded_files[0])
 
-    return str(actual_path), info
+    return final_audio_path, info
 
 
-def transcribe_audio(audio_path: str, model_name: Optional[str] = None, language: Optional[str] = None) -> tuple[str, str, float]:
-    """Transcribe audio file using faster-whisper"""
-    global whisper_model
-    
+def transcribe_audio(audio_path: str, language: Optional[str] = None) -> tuple[str, str]:
+    """Transcribe audio file using faster-whisper. Returns (transcript, detected_language)."""
     if whisper_model is None:
         raise HTTPException(status_code=503, detail="Whisper model not loaded")
-    
-    # Use provided model or default
-    model = whisper_model
-    if model_name and model_name != WHISPER_MODEL:
-        # Load different model on-demand (not ideal for production, but works)
-        model = WhisperModel(
-            model_name,
-            device=DEVICE,
-            compute_type=COMPUTE_TYPE,
-            download_root="/root/.cache/huggingface"
-        )
-    
-    segments, info = model.transcribe(
+
+    segments, info = whisper_model.transcribe(
         audio_path,
         language=language,
         beam_size=5,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500)
     )
-    
+
     transcript = " ".join([segment.text for segment in segments])
-    return transcript, info.language, info.duration
+    return transcript.strip(), info.language
+
+
+def cleanup_temp_files(audio_path: str):
+    """Clean up temporary files."""
+    try:
+        Path(audio_path).unlink(missing_ok=True)
+        Path(audio_path).parent.rmdir()
+    except Exception as e:
+        logger.warning(f"Cleanup failed: {e}")
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "model": MODEL_SIZE, "device": DEVICE}
 
 
 @app.post("/transcribe", response_model=TranscribeResponse)
-async def transcribe_url(request: TranscribeRequest, background_tasks: BackgroundTasks):
-    """Transcribe a video/audio URL"""
-    if whisper_model is None:
-        raise HTTPException(status_code=503, detail="Whisper model not loaded")
-    
+async def transcribe(request: TranscribeRequest, background_tasks: BackgroundTasks):
+    """
+    Transcribe audio from a social media URL.
+    Supports: YouTube, Instagram Reels, TikTok, Twitter/X, and more (via yt-dlp).
+    """
     url = str(request.url)
-    audio_path = None
-    
+    model_override = request.model or MODEL_SIZE
+    language = request.language
+
+    logger.info(f"Transcription request: {url}")
+
+    # Download audio
     try:
-        # Download audio
         audio_path, info = download_audio(url)
-        
-        # Transcribe
-        transcript, language, duration = transcribe_audio(
-            audio_path,
-            model_name=request.model,
-            language=request.language
-        )
-        
-        # Cleanup audio file in background
-        background_tasks.add_task(cleanup_file, audio_path)
-        
-        return TranscribeResponse(
-            transcript=transcript.strip(),
-            duration=duration,
-            language=language,
-            model_used=request.model or WHISPER_MODEL,
-            source_url=url,
-            title=info.get('title')
-        )
-        
-    except yt_dlp.utils.DownloadError as e:
-        if audio_path:
-            cleanup_file(audio_path)
-        raise HTTPException(status_code=400, detail=f"Failed to download: {str(e)}")
     except Exception as e:
-        if audio_path:
-            cleanup_file(audio_path)
+        logger.error(f"Download failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to download audio: {str(e)}")
+
+    # Transcribe
+    try:
+        transcript, detected_lang = transcribe_audio(audio_path, language)
+    except Exception as e:
+        logger.error(f"Transcription failed: {e}")
+        cleanup_temp_files(audio_path)
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
+    # Schedule cleanup
+    background_tasks.add_task(cleanup_temp_files, audio_path)
 
-def cleanup_file(filepath: str):
-    """Clean up temporary file"""
-    try:
-        Path(filepath).unlink(missing_ok=True)
-    except Exception:
-        pass
+    # Extract metadata
+    platform = info.get('extractor_key', 'unknown')
+    title = info.get('title', 'Untitled')
+    duration = info.get('duration', 0)
+
+    return TranscribeResponse(
+        transcript=transcript,
+        language=detected_lang,
+        duration=duration,
+        platform=platform,
+        title=title,
+        url=url
+    )
+
+
+@app.get("/")
+async def root():
+    return {
+        "service": "Transcription API",
+        "version": "1.0.0",
+        "endpoints": {
+            "health": "/health",
+            "transcribe": "/transcribe (POST)"
+        },
+        "supported_platforms": "YouTube, Instagram Reels, TikTok, Twitter/X, and 1000+ sites via yt-dlp"
+    }
 
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
