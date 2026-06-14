@@ -22,11 +22,11 @@ app = FastAPI(
 )
 
 # Model configuration
-MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")  # tiny, base, small, medium, large-v3
-DEVICE = os.getenv("WHISPER_DEVICE", "auto")      # auto, cpu, cuda
-COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # int8, int16, float16, float32
+MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")
+DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
+COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 
-# Global model instance (loaded on startup)
+# Global model instance (lazy loaded on first request)
 whisper_model: Optional[WhisperModel] = None
 
 
@@ -45,22 +45,23 @@ class TranscribeResponse(BaseModel):
     url: str
 
 
-@app.on_event("startup")
-async def load_model():
-    """Load Whisper model on startup."""
+def get_model(model_name: str = None) -> WhisperModel:
+    """Lazy-load Whisper model on first request."""
     global whisper_model
-    model_name = MODEL_SIZE
-    logger.info(f"Loading Whisper model: {model_name} on {DEVICE} with {COMPUTE_TYPE}")
-    try:
-        whisper_model = WhisperModel(
-            model_name,
-            device=DEVICE,
-            compute_type=COMPUTE_TYPE
-        )
-        logger.info("Whisper model loaded successfully")
-    except Exception as e:
-        logger.error(f"Failed to load Whisper model: {e}")
-        raise
+    if whisper_model is None:
+        name = model_name or MODEL_SIZE
+        logger.info(f"Loading Whisper model: {name} on {DEVICE} with {COMPUTE_TYPE}")
+        try:
+            whisper_model = WhisperModel(
+                name,
+                device=DEVICE,
+                compute_type=COMPUTE_TYPE
+            )
+            logger.info("Whisper model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load Whisper model: {e}")
+            raise HTTPException(status_code=503, detail=f"Whisper model failed to load: {str(e)}")
+    return whisper_model
 
 
 def download_audio(url: str) -> tuple[str, dict]:
@@ -82,7 +83,6 @@ def download_audio(url: str) -> tuple[str, dict]:
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        # Find the downloaded file
         downloaded_files = list(Path(temp_dir).glob("audio.*"))
         if not downloaded_files:
             raise HTTPException(status_code=500, detail="Audio download failed")
@@ -93,10 +93,9 @@ def download_audio(url: str) -> tuple[str, dict]:
 
 def transcribe_audio(audio_path: str, language: Optional[str] = None) -> tuple[str, str]:
     """Transcribe audio file using faster-whisper. Returns (transcript, detected_language)."""
-    if whisper_model is None:
-        raise HTTPException(status_code=503, detail="Whisper model not loaded")
+    model = get_model()
 
-    segments, info = whisper_model.transcribe(
+    segments, info = model.transcribe(
         audio_path,
         language=language,
         beam_size=5,
@@ -120,7 +119,13 @@ def cleanup_temp_files(audio_path: str):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "model": MODEL_SIZE, "device": DEVICE}
+    model_loaded = whisper_model is not None
+    return {
+        "status": "healthy" if model_loaded else "starting",
+        "model": MODEL_SIZE,
+        "device": DEVICE,
+        "model_loaded": model_loaded
+    }
 
 
 @app.post("/transcribe", response_model=TranscribeResponse)
@@ -130,7 +135,6 @@ async def transcribe(request: TranscribeRequest, background_tasks: BackgroundTas
     Supports: YouTube, Instagram Reels, TikTok, Twitter/X, and more (via yt-dlp).
     """
     url = str(request.url)
-    model_override = request.model or MODEL_SIZE
     language = request.language
 
     logger.info(f"Transcription request: {url}")
